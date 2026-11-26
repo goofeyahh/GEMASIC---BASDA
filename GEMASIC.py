@@ -1,5 +1,6 @@
 """
 GEMASIC - Sistem Informasi Pengelolaan Beasiswa Cinta Bergema (versi CLI sederhana)
+Pemerintah Kabupaten Jember
 Hanya butuh: pip install psycopg2-binary
 """
 import psycopg2
@@ -25,6 +26,10 @@ BANNER = r"""
    Beasiswa Cinta Bergema - Kabupaten Jember
 """
 
+# Dokumen yang diperiksa tiap jenis verifikator (selain itu diperiksa verifikator Umum)
+DOKUMEN_TAHFIDZ = "('Sertifikat Hafalan Al-Quran')"
+DOKUMEN_PTN = "('Kartu Tanda Mahasiswa (KTM)', 'Transkrip Nilai')"
+
 try:
     conn = psycopg2.connect(dbname="GEMASIC", user="postgres",
                             password="anjaybasda", host="localhost", port="5432")
@@ -36,6 +41,7 @@ except Exception as e:
 
 # =====================================================
 # 2. FUNGSI BANTU DATABASE
+# Catatan: tanda % yang bukan %s harus ditulis %% jika query memakai parameter
 # =====================================================
 def ambil_semua(sql, params=()):
     """Jalankan SELECT, kembalikan semua baris (list)."""
@@ -64,7 +70,7 @@ def ambil_satu(sql, params=()):
 
 
 def ubah(sql, params=()):
-    """Jalankan INSERT / UPDATE. Kembalikan True jika berhasil."""
+    """Jalankan INSERT / UPDATE / DELETE. Kembalikan True jika berhasil."""
     try:
         cur.execute(sql, params)
         conn.commit()
@@ -138,11 +144,13 @@ def tanya_password(label):
         print(label + ": ", end="", flush=True)
         password = ""
         tombol = msvcrt.getwch()
-        while tombol != "\r":                 # ulangi sampai ENTER ditekan
-            if tombol == "\b":                # Backspace
+        while tombol != "\r" and tombol != "\n":      # ulangi sampai ENTER ditekan
+            if tombol == "\b":                        # Backspace
                 if len(password) > 0:
                     password = password[:-1]
                     print("\b \b", end="", flush=True)
+            elif tombol == "\x00" or tombol == "\xe0":   # tombol khusus (panah, F1, dst): lewati
+                msvcrt.getwch()
             else:
                 password = password + tombol
                 print("*", end="", flush=True)
@@ -179,7 +187,7 @@ def tanya_email():
 
 
 def tanya_tanggal(label):
-    """Format YYYY-MM-DD (nilai tanggal yang tidak ada akan ditolak oleh database)."""
+    """Format YYYY-MM-DD (tanggal yang tidak ada akan ditolak oleh database)."""
     while True:
         v = input(label + " (YYYY-MM-DD): ").strip()
         if len(v) == 10 and v[4] == "-" and v[7] == "-":
@@ -204,6 +212,28 @@ def pilih_id(sql, params, kolom, label):
         print("ID tidak ada di daftar.")
 
 
+def sinkron_status(id_pendaftaran):
+    """Perbarui status_pendaftaran (Menunggu <-> Diverifikasi) dari kondisi dokumen pendaftaran tsb:
+    semua dokumen sudah diperiksa dan tidak ada yang perlu perbaikan -> Diverifikasi."""
+    ada_dokumen = ambil_satu("SELECT 1 FROM dokumen_persyaratan WHERE id_pendaftaran = %s LIMIT 1",
+                             (id_pendaftaran,))
+    if ada_dokumen is None:
+        return
+    belum = ambil_satu("""
+        SELECT 1 FROM dokumen_persyaratan d
+        WHERE d.id_pendaftaran = %s
+          AND (NOT EXISTS (SELECT 1 FROM verifikasi v WHERE v.id_dokumen = d.id_dokumen)
+               OR EXISTS (SELECT 1 FROM verifikasi v WHERE v.id_dokumen = d.id_dokumen
+                          AND v.catatan_verifikasi LIKE 'Perbaikan%%'))
+        LIMIT 1""", (id_pendaftaran,))
+    if belum is None:
+        ubah("""UPDATE pendaftaran SET status_pendaftaran = 'Diverifikasi'
+                WHERE id_pendaftaran = %s AND status_pendaftaran = 'Menunggu'""", (id_pendaftaran,))
+    else:
+        ubah("""UPDATE pendaftaran SET status_pendaftaran = 'Menunggu'
+                WHERE id_pendaftaran = %s AND status_pendaftaran = 'Diverifikasi'""", (id_pendaftaran,))
+
+
 # =====================================================
 # 4. LOGIN & REGISTRASI
 # =====================================================
@@ -214,14 +244,12 @@ def login():
     email = tanya("Email")
     password = tanya_password("Password")
     data = ambil_satu("""
-        SELECT p.id_pengguna, p.nama_pengguna, p.status_akun,
-               CASE WHEN m.id_mahasiswa IS NOT NULL THEN 'mahasiswa'
-                    WHEN v.id_verifikator IS NOT NULL THEN 'verifikator'
+        SELECT p.id_pengguna, p.nama_pengguna, p.status_akun::text,
+               CASE WHEN EXISTS (SELECT 1 FROM mahasiswa m WHERE m.id_pengguna = p.id_pengguna) THEN 'mahasiswa'
+                    WHEN EXISTS (SELECT 1 FROM verifikator v WHERE v.id_pengguna = p.id_pengguna) THEN 'verifikator'
                     ELSE 'petugas' END
         FROM pengguna p
-        LEFT JOIN mahasiswa m ON m.id_pengguna = p.id_pengguna
-        LEFT JOIN verifikator v ON v.id_pengguna = p.id_pengguna
-        WHERE p.email = %s AND p.password = %s""", (email, password))
+        WHERE lower(p.email) = lower(%s) AND p.password = %s""", (email, password))
     if data is None:
         print("Email atau password salah.")
         return None
@@ -239,12 +267,23 @@ def register_mahasiswa():
     nim = tanya_digit("NIM", 5, 20)
     nik = tanya_digit("NIK (16 digit)", 16, 16)
     tgl = tanya_tanggal("Tanggal lahir")
-    hp = tanya_digit("No. HP", 8, 20)
+    hp = tanya_digit("No. HP", 8, 12)
     kelurahan = tanya("Kelurahan")
     kecamatan = tanya("Kecamatan")
     kabupaten = tanya("Kabupaten")
     univ = tanya("Nama universitas")
     prodi = tanya("Program studi")
+
+    # Cek duplikat di sini supaya pesannya jelas (email & NIK di pengguna; NIM & no HP di mahasiswa)
+    if ambil_satu("SELECT 1 FROM pengguna WHERE lower(email) = lower(%s)", (email,)) is not None:
+        print("Email sudah terdaftar.")
+        return
+    if ambil_satu("SELECT 1 FROM pengguna WHERE nik = %s", (nik,)) is not None:
+        print("NIK sudah terdaftar.")
+        return
+    if ambil_satu("SELECT 1 FROM mahasiswa WHERE nim = %s OR no_hp = %s", (nim, hp)) is not None:
+        print("NIM atau No. HP sudah terdaftar.")
+        return
 
     # Semua INSERT di bawah satu transaksi: jika ada yang gagal, semuanya dibatalkan
     try:
@@ -264,14 +303,14 @@ def register_mahasiswa():
             baris = cur.fetchone()
         id_prodi = baris[0]
 
-        cur.execute("""INSERT INTO pengguna (nama_pengguna, email, password)
-                       VALUES (%s, %s, %s) RETURNING id_pengguna""", (nama, email, password))
+        cur.execute("""INSERT INTO pengguna (nik, nama_pengguna, email, password, status_akun)
+                       VALUES (%s, %s, %s, %s, 'Aktif') RETURNING id_pengguna""", (nik, nama, email, password))
         id_pengguna = cur.fetchone()[0]
 
-        cur.execute("""INSERT INTO mahasiswa (nim, nik, nama_mahasiswa, tanggal_lahir, no_hp, kelurahan,
-                                              kecamatan, kabupaten, id_pengguna, id_program_studi)
-                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
-                    (nim, nik, nama, tgl, hp, kelurahan, kecamatan, kabupaten, id_pengguna, id_prodi))
+        cur.execute("""INSERT INTO mahasiswa (id_pengguna, nim, tanggal_lahir, no_hp,
+                                              kelurahan, kecamatan, kabupaten, id_program_studi)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
+                    (id_pengguna, nim, tgl, hp, kelurahan, kecamatan, kabupaten, id_prodi))
         conn.commit()
         print("Registrasi berhasil. Silakan login.")
     except Exception as e:
@@ -292,71 +331,105 @@ def mhs_daftar(uid):
                             FROM persyaratan WHERE id_jalur = %s ORDER BY 1""", (id_jalur,))
     tampil_tabel(["Persyaratan", "Keterangan"], syarat)
     if input("Daftar ke jalur ini? (y/n): ") == "y":
-        if ubah("INSERT INTO pendaftaran (id_jalur, id_pengguna) VALUES (%s, %s)", (id_jalur, uid)):
+        if ambil_satu("SELECT 1 FROM pendaftaran WHERE id_jalur = %s AND id_pengguna = %s", (id_jalur, uid)) is not None:
+            print("Kamu sudah terdaftar di jalur ini.")
+        elif ubah("""INSERT INTO pendaftaran (tanggal_daftar, status_pendaftaran, id_jalur, id_pengguna)
+                     VALUES (CURRENT_DATE, 'Menunggu', %s, %s)""", (id_jalur, uid)):
             print("Pendaftaran berhasil. Lengkapi dokumen lewat menu Upload dokumen.")
 
 
 def mhs_upload(uid):
     judul("UPLOAD DOKUMEN")
+    # Dokumen sekarang melekat pada satu pendaftaran, jadi mahasiswa harus sudah mendaftar
+    if ambil_satu("SELECT 1 FROM pendaftaran WHERE id_pengguna = %s LIMIT 1", (uid,)) is None:
+        print("Kamu belum mendaftar beasiswa. Daftar dulu lewat menu Daftar beasiswa.")
+        return
+    id_pd = pilih_id("""
+        SELECT pd.id_pendaftaran, j.nama_jalur, pd.tanggal_daftar, pd.status_pendaftaran::text
+        FROM pendaftaran pd
+        JOIN jalur_beasiswa j ON j.id_jalur = pd.id_jalur
+        WHERE pd.id_pengguna = %s
+        ORDER BY 1""", (uid,), ["ID", "Jalur", "Tanggal daftar", "Status"], "ID pendaftaran")
+    if id_pd == 0:
+        return
     id_jenis = pilih_id("SELECT id_jenis_dokumen, nama_jenis_dokumen FROM jenis_dokumen ORDER BY 1", (),
                         ["ID", "Jenis dokumen"], "ID jenis dokumen")
     if id_jenis == 0:
         return
     nama_file = tanya("Nama file (contoh: ktp_saya.pdf)")
-    lokasi = tanya("Lokasi file (contoh: /uploads/mhs1/ktp_saya.pdf)")
-    if ubah("""INSERT INTO dokumen_persyaratan (nama_file, lokasi_file, jenis_dokumen_id_jenis_dokumen,
-                                                mahasiswa_id_pengguna) VALUES (%s, %s, %s, %s)""",
-            (nama_file, lokasi, id_jenis, uid)):
+    if ubah("""INSERT INTO dokumen_persyaratan (nama_file, tanggal_upload, id_jenis_dokumen, id_pendaftaran)
+               VALUES (%s, CURRENT_DATE, %s, %s)""", (nama_file, id_jenis, id_pd)):
+        sinkron_status(id_pd)       # dokumen baru belum diperiksa -> status kembali Menunggu
         print("Dokumen tersimpan, menunggu verifikasi.")
 
 
 def mhs_perbaiki(uid):
     judul("LENGKAPI BERKAS PERBAIKAN")
+    # Dokumen perlu perbaikan = punya verifikasi dengan catatan berawalan "Perbaikan"
     id_dok = pilih_id("""
-        SELECT d.id_dokumen, jd.nama_jenis_dokumen, d.nama_file, d.catatan_verifikasi
+        SELECT d.id_dokumen, jd.nama_jenis_dokumen, d.nama_file,
+               (SELECT v.catatan_verifikasi FROM verifikasi v
+                WHERE v.id_dokumen = d.id_dokumen AND v.catatan_verifikasi LIKE 'Perbaikan%%'
+                ORDER BY v.id_verifikasi DESC LIMIT 1)
         FROM dokumen_persyaratan d
-        JOIN jenis_dokumen jd ON jd.id_jenis_dokumen = d.jenis_dokumen_id_jenis_dokumen
-        WHERE d.mahasiswa_id_pengguna = %s AND d.status_verifikasi = 'Perbaikan'
+        JOIN pendaftaran pd ON pd.id_pendaftaran = d.id_pendaftaran
+        JOIN jenis_dokumen jd ON jd.id_jenis_dokumen = d.id_jenis_dokumen
+        WHERE pd.id_pengguna = %s
+          AND EXISTS (SELECT 1 FROM verifikasi v WHERE v.id_dokumen = d.id_dokumen
+                      AND v.catatan_verifikasi LIKE 'Perbaikan%%')
         ORDER BY 1""", (uid,), ["ID", "Jenis", "File lama", "Catatan verifikator"], "ID dokumen")
     if id_dok == 0:
         return
     nama_file = tanya("Nama file baru")
-    lokasi = tanya("Lokasi file baru")
-    if ubah("""UPDATE dokumen_persyaratan SET nama_file = %s, lokasi_file = %s,
-               tanggal_upload = CURRENT_DATE, status_verifikasi = 'Menunggu'
-               WHERE id_dokumen = %s""", (nama_file, lokasi, id_dok)):
-        print("Berkas perbaikan terkirim.")
+    try:
+        cur.execute("""UPDATE dokumen_persyaratan SET nama_file = %s, tanggal_upload = CURRENT_DATE
+                       WHERE id_dokumen = %s""", (nama_file, id_dok))
+        # Hapus catatan perbaikan lama agar dokumen diperiksa ulang
+        cur.execute("""DELETE FROM verifikasi WHERE id_dokumen = %s AND catatan_verifikasi LIKE 'Perbaikan%%'""",
+                    (id_dok,))
+        conn.commit()
+        pemilik = ambil_satu("SELECT id_pendaftaran FROM dokumen_persyaratan WHERE id_dokumen = %s", (id_dok,))
+        sinkron_status(pemilik[0])
+        print("Berkas perbaikan terkirim, menunggu verifikasi ulang.")
+    except Exception as e:
+        conn.rollback()
+        print("[ERROR]", str(e).split("\n")[0])
 
 
 def mhs_status(uid):
     judul("STATUS PENDAFTARAN")
     baris = ambil_semua("""
-        SELECT pd.id_pendaftaran, j.nama_jalur, pd.tanggal_daftar,
-               COALESCE(pt.status_keputusan, 'Dalam proses'), COALESCE(c.status_pencairan, '-')
+        SELECT pd.id_pendaftaran, j.nama_jalur, pd.tanggal_daftar, pd.status_pendaftaran::text,
+               COALESCE(pt.status_keputusan::text, '-'), COALESCE(c.status_pencairan, '-')
         FROM pendaftaran pd
         JOIN jalur_beasiswa j ON j.id_jalur = pd.id_jalur
-        LEFT JOIN penetapan pt ON pt.jalur_beasiswa_id_jalur = pd.id_jalur
-                              AND pt.mahasiswa_id_pengguna = pd.id_pengguna
-        LEFT JOIN pencairan c ON c.penetapan_id_penetapan = pt.id_penetapan
+        LEFT JOIN penetapan pt ON pt.id_pendaftaran = pd.id_pendaftaran
+        LEFT JOIN pencairan c ON c.id_penetapan = pt.id_penetapan
         WHERE pd.id_pengguna = %s
         ORDER BY pd.id_pendaftaran""", (uid,))
-    tampil_tabel(["ID", "Jalur", "Tanggal daftar", "Status", "Pencairan"], baris)
+    tampil_tabel(["ID", "Jalur", "Tanggal daftar", "Status", "Keputusan", "Pencairan"], baris)
 
     judul("STATUS DOKUMEN")
     baris = ambil_semua("""
-        SELECT d.id_dokumen, jd.nama_jenis_dokumen, d.nama_file, d.status_verifikasi,
-               COALESCE(d.catatan_verifikasi, '-')
+        SELECT d.id_dokumen, d.id_pendaftaran, jd.nama_jenis_dokumen, d.nama_file,
+               CASE WHEN EXISTS (SELECT 1 FROM verifikasi v WHERE v.id_dokumen = d.id_dokumen
+                                 AND v.catatan_verifikasi LIKE 'Perbaikan%%') THEN 'Perlu perbaikan'
+                    WHEN EXISTS (SELECT 1 FROM verifikasi v WHERE v.id_dokumen = d.id_dokumen) THEN 'Terverifikasi'
+                    ELSE 'Menunggu' END,
+               COALESCE((SELECT v.catatan_verifikasi FROM verifikasi v WHERE v.id_dokumen = d.id_dokumen
+                         ORDER BY v.id_verifikasi DESC LIMIT 1), '-')
         FROM dokumen_persyaratan d
-        JOIN jenis_dokumen jd ON jd.id_jenis_dokumen = d.jenis_dokumen_id_jenis_dokumen
-        WHERE d.mahasiswa_id_pengguna = %s
+        JOIN pendaftaran pd ON pd.id_pendaftaran = d.id_pendaftaran
+        JOIN jenis_dokumen jd ON jd.id_jenis_dokumen = d.id_jenis_dokumen
+        WHERE pd.id_pengguna = %s
         ORDER BY d.id_dokumen""", (uid,))
-    tampil_tabel(["ID", "Jenis", "File", "Status", "Catatan"], baris)
+    tampil_tabel(["ID", "ID Daftar", "Jenis", "File", "Status", "Catatan terakhir"], baris)
 
 
 def mhs_pengumuman(uid):
     judul("PENGUMUMAN")
     baris = ambil_semua("""SELECT tanggal_publikasi, judul, isi_pengumuman FROM pengumuman
-                           WHERE status_pengumuman = 'Terbit' ORDER BY tanggal_publikasi DESC""")
+                           WHERE status_pengumuman = 'Terbit' ORDER BY tanggal_publikasi DESC, id_pengumuman DESC""")
     if len(baris) == 0:
         print("(belum ada pengumuman)")
     for b in baris:
@@ -367,15 +440,28 @@ def mhs_pengumuman(uid):
 def mhs_rekening(uid):
     judul("REKENING BANK")
     baris = ambil_semua("""SELECT id_rekening, nama_bank, nomor_rekening, nama_pemilik_rekening, status_validasi
-                           FROM rekening_bank WHERE mahasiswa_id_pengguna = %s ORDER BY 1""", (uid,))
+                           FROM rekening_bank WHERE id_mahasiswa = %s ORDER BY 1""", (uid,))
     tampil_tabel(["ID", "Bank", "No. Rekening", "Atas nama", "Status"], baris)
     if input("Ajukan rekening baru? (y/n): ") == "y":
         bank = tanya("Nama bank")
         nomor = tanya_digit("Nomor rekening", 5, 30)
         atas_nama = tanya("Atas nama")
-        if ubah("""INSERT INTO rekening_bank (nama_bank, nomor_rekening, nama_pemilik_rekening,
-                                               mahasiswa_id_pengguna) VALUES (%s, %s, %s, %s)""",
-                (bank, nomor, atas_nama, uid)):
+        if ambil_satu("SELECT 1 FROM rekening_bank WHERE nomor_rekening = %s", (nomor,)) is not None:
+            print("Nomor rekening sudah terdaftar.")
+            return
+        # Rekening ditangani petugas pencairan yang paling sedikit menangani rekening
+        petugas = ambil_satu("""
+            SELECT p.id_pengguna FROM pengguna p
+            LEFT JOIN rekening_bank r ON r.id_pengguna = p.id_pengguna
+            WHERE p.id_pengguna NOT IN (SELECT id_pengguna FROM mahasiswa)
+              AND p.id_pengguna NOT IN (SELECT id_pengguna FROM verifikator)
+            GROUP BY p.id_pengguna
+            ORDER BY COUNT(r.id_rekening), p.id_pengguna LIMIT 1""")
+        if petugas is None:
+            print("Belum ada petugas pencairan.")
+        elif ubah("""INSERT INTO rekening_bank (nama_bank, nomor_rekening, nama_pemilik_rekening,
+                                               status_validasi, saldo_rekening, id_pengguna, id_mahasiswa)
+                     VALUES (%s, %s, %s, 'Belum Valid', 0, %s, %s)""", (bank, nomor, atas_nama, petugas[0], uid)):
             print("Rekening diajukan, menunggu validasi petugas pencairan.")
 
 
@@ -405,124 +491,139 @@ def dashboard_mahasiswa(uid, nama):
 # =====================================================
 # 6. FITUR VERIFIKATOR
 # =====================================================
-def vf_info(uid):
-    """Kembalikan (id_verifikator, jenis_verifikator)."""
-    return ambil_satu("SELECT id_verifikator, jenis_verifikator FROM verifikator WHERE id_pengguna = %s", (uid,))
+def jenis_verifikator(uid):
+    """Kembalikan 'Umum', 'Tahfidz', atau 'PTN'."""
+    data = ambil_satu("SELECT jenis_verifikator::text FROM verifikator WHERE id_pengguna = %s", (uid,))
+    return data[0]
 
 
 def vf_pendaftaran(uid):
     judul("DATA PENDAFTARAN")
     baris = ambil_semua("""
-        SELECT pd.id_pendaftaran, m.nama_mahasiswa, u.nama_universitas, j.nama_jalur, pd.tanggal_daftar,
-               COALESCE(pt.status_keputusan, 'Dalam proses')
+        SELECT pd.id_pendaftaran, pg.nama_pengguna, u.nama_universitas, j.nama_jalur,
+               pd.tanggal_daftar, pd.status_pendaftaran::text
         FROM pendaftaran pd
+        JOIN pengguna pg ON pg.id_pengguna = pd.id_pengguna
         JOIN mahasiswa m ON m.id_pengguna = pd.id_pengguna
         JOIN program_studi ps ON ps.id_program_studi = m.id_program_studi
         JOIN universitas u ON u.id_universitas = ps.id_universitas
         JOIN jalur_beasiswa j ON j.id_jalur = pd.id_jalur
-        LEFT JOIN penetapan pt ON pt.jalur_beasiswa_id_jalur = pd.id_jalur
-                              AND pt.mahasiswa_id_pengguna = pd.id_pengguna
         ORDER BY pd.id_pendaftaran""")
     tampil_tabel(["ID", "Mahasiswa", "Universitas", "Jalur", "Tanggal", "Status"], baris)
 
 
 def vf_verifikasi(uid):
     judul("VERIFIKASI DOKUMEN")
-    info = vf_info(uid)
-    id_verifikator = info[0]
-    jenis = info[1]
+    jenis = jenis_verifikator(uid)
     print("Verifikator " + jenis)
 
     # Tiap jenis verifikator hanya memeriksa dokumen miliknya
     if jenis == "Tahfidz":
-        filter_jenis = "jd.nama_jenis_dokumen = 'Sertifikat Hafalan Al-Quran'"
+        filter_jenis = "jd.nama_jenis_dokumen IN " + DOKUMEN_TAHFIDZ
     elif jenis == "PTN":
-        filter_jenis = "jd.nama_jenis_dokumen IN ('Kartu Tanda Mahasiswa (KTM)', 'Transkrip Nilai')"
+        filter_jenis = "jd.nama_jenis_dokumen IN " + DOKUMEN_PTN
     else:
-        filter_jenis = ("jd.nama_jenis_dokumen NOT IN ('Sertifikat Hafalan Al-Quran', "
-                        "'Kartu Tanda Mahasiswa (KTM)', 'Transkrip Nilai')")
+        filter_jenis = ("jd.nama_jenis_dokumen NOT IN " + DOKUMEN_TAHFIDZ +
+                        " AND jd.nama_jenis_dokumen NOT IN " + DOKUMEN_PTN)
 
+    # Daftar dokumen yang belum pernah diperiksa oleh verifikator ini
     sql = """
-        SELECT d.id_dokumen, m.nama_mahasiswa, jd.nama_jenis_dokumen, d.nama_file
+        SELECT d.id_dokumen, pg.nama_pengguna, jd.nama_jenis_dokumen, d.nama_file
         FROM dokumen_persyaratan d
-        JOIN jenis_dokumen jd ON jd.id_jenis_dokumen = d.jenis_dokumen_id_jenis_dokumen
-        JOIN mahasiswa m ON m.id_pengguna = d.mahasiswa_id_pengguna
-        WHERE d.status_verifikasi = 'Menunggu' AND """ + filter_jenis + " ORDER BY 1"
-    id_dok = pilih_id(sql, (), ["ID", "Mahasiswa", "Jenis", "File"], "ID dokumen")
+        JOIN jenis_dokumen jd ON jd.id_jenis_dokumen = d.id_jenis_dokumen
+        JOIN pendaftaran pd ON pd.id_pendaftaran = d.id_pendaftaran
+        JOIN pengguna pg ON pg.id_pengguna = pd.id_pengguna
+        WHERE NOT EXISTS (SELECT 1 FROM verifikasi v WHERE v.id_dokumen = d.id_dokumen AND v.id_verifikator = %s)
+          AND """ + filter_jenis + " ORDER BY 1"
+    id_dok = pilih_id(sql, (uid,), ["ID", "Mahasiswa", "Jenis", "File"], "ID dokumen")
     if id_dok == 0:
         return
 
     hasil = menu("HASIL", ["Valid", "Perbaikan"])
-    catatan = tanya("Catatan verifikasi")
-    try:
-        cur.execute("""UPDATE dokumen_persyaratan SET status_verifikasi = %s, catatan_verifikasi = %s,
-                       verifikator_id_verifikator = %s WHERE id_dokumen = %s""",
-                    (hasil, catatan, id_verifikator, id_dok))
-        cur.execute("""UPDATE verifikator SET tanggal_verifikasi = CURRENT_DATE, catatan_verifikasi = %s
-                       WHERE id_verifikator = %s""", (catatan, id_verifikator))
-        conn.commit()
+    if hasil == "Perbaikan":
+        catatan = "Perbaikan: " + tanya("Alasan perbaikan")      # awalan "Perbaikan" = berkas perlu diperbaiki
+    else:
+        catatan = input("Catatan verifikasi (boleh kosong): ").strip()
+        if catatan == "":
+            catatan = None
+    if ubah("""INSERT INTO verifikasi (tanggal_verifikasi, catatan_verifikasi, id_verifikator, id_dokumen)
+               VALUES (CURRENT_DATE, %s, %s, %s)""", (catatan, uid, id_dok)):
+        pemilik = ambil_satu("SELECT id_pendaftaran FROM dokumen_persyaratan WHERE id_dokumen = %s", (id_dok,))
+        sinkron_status(pemilik[0])
         print("Hasil verifikasi disimpan.")
+
+
+def vf_nilai(uid):
+    judul("PENILAIAN KELAYAKAN")
+    print("(hanya pendaftar berstatus Diverifikasi)")
+    id_pd = pilih_id("""
+        SELECT pd.id_pendaftaran, pg.nama_pengguna, j.nama_jalur
+        FROM pendaftaran pd
+        JOIN pengguna pg ON pg.id_pengguna = pd.id_pengguna
+        JOIN jalur_beasiswa j ON j.id_jalur = pd.id_jalur
+        WHERE pd.status_pendaftaran = 'Diverifikasi'
+        ORDER BY 1""", (), ["ID", "Mahasiswa", "Jalur"], "ID pendaftaran")
+    if id_pd == 0:
+        return
+    nilai = tanya_angka("Nilai (0-100)", 0, 100)
+    catatan = input("Catatan penilaian (boleh kosong, maks 100 huruf): ").strip()
+    if catatan == "":
+        catatan = None
+    try:
+        cur.execute("""INSERT INTO penilaian (nilai, catatan_penilaian, tanggal_penilaian,
+                                              id_pendaftaran, id_pengguna)
+                       VALUES (%s, %s, CURRENT_DATE, %s, %s)""", (nilai, catatan, id_pd, uid))
+        cur.execute("UPDATE pendaftaran SET status_pendaftaran = 'Dinilai' WHERE id_pendaftaran = %s", (id_pd,))
+        conn.commit()
+        print("Penilaian tersimpan.")
     except Exception as e:
         conn.rollback()
         print("[ERROR]", str(e).split("\n")[0])
 
 
-def vf_nilai(uid):
-    judul("PENILAIAN KELAYAKAN")
-    print("(hanya pendaftar yang seluruh dokumennya sudah Valid)")
-    id_pd = pilih_id("""
-        SELECT pd.id_pendaftaran, m.nama_mahasiswa, j.nama_jalur
-        FROM pendaftaran pd
-        JOIN mahasiswa m ON m.id_pengguna = pd.id_pengguna
-        JOIN jalur_beasiswa j ON j.id_jalur = pd.id_jalur
-        WHERE EXISTS (SELECT 1 FROM dokumen_persyaratan d WHERE d.mahasiswa_id_pengguna = pd.id_pengguna)
-          AND NOT EXISTS (SELECT 1 FROM dokumen_persyaratan d
-                          WHERE d.mahasiswa_id_pengguna = pd.id_pengguna AND d.status_verifikasi <> 'Valid')
-          AND NOT EXISTS (SELECT 1 FROM penilaian n
-                          WHERE n.pendaftaran_id_pendaftaran = pd.id_pendaftaran AND n.pengguna_id_pengguna = %s)
-        ORDER BY 1""", (uid,), ["ID", "Mahasiswa", "Jalur"], "ID pendaftaran")
-    if id_pd == 0:
-        return
-    nilai = tanya_angka("Nilai (0-100)", 0, 100)
-    catatan = tanya("Catatan penilaian")
-    if ubah("""INSERT INTO penilaian (nilai, catatan_penilaian, pendaftaran_id_pendaftaran, pengguna_id_pengguna)
-               VALUES (%s, %s, %s, %s)""", (nilai, catatan, id_pd, uid)):
-        print("Penilaian tersimpan.")
-
-
 def vf_tetapkan(uid):
     judul("PENETAPAN PENERIMA")
+    print("(hanya pendaftar berstatus Dinilai)")
     id_pd = pilih_id("""
-        SELECT pd.id_pendaftaran, m.nama_mahasiswa, j.nama_jalur, ROUND(AVG(n.nilai), 1)
+        SELECT pd.id_pendaftaran, pg.nama_pengguna, j.nama_jalur, ROUND(AVG(n.nilai), 1)
         FROM pendaftaran pd
-        JOIN mahasiswa m ON m.id_pengguna = pd.id_pengguna
+        JOIN pengguna pg ON pg.id_pengguna = pd.id_pengguna
         JOIN jalur_beasiswa j ON j.id_jalur = pd.id_jalur
-        JOIN penilaian n ON n.pendaftaran_id_pendaftaran = pd.id_pendaftaran
-        WHERE NOT EXISTS (SELECT 1 FROM penetapan t WHERE t.jalur_beasiswa_id_jalur = pd.id_jalur
-                          AND t.mahasiswa_id_pengguna = pd.id_pengguna)
-        GROUP BY pd.id_pendaftaran, m.nama_mahasiswa, j.nama_jalur
+        JOIN penilaian n ON n.id_pendaftaran = pd.id_pendaftaran
+        WHERE pd.status_pendaftaran = 'Dinilai'
+        GROUP BY pd.id_pendaftaran, pg.nama_pengguna, j.nama_jalur
         ORDER BY 1""", (), ["ID", "Mahasiswa", "Jalur", "Rata-rata nilai"], "ID pendaftaran")
     if id_pd == 0:
         return
+    data = ambil_satu("SELECT id_jalur FROM pendaftaran WHERE id_pendaftaran = %s", (id_pd,))
+    id_jalur = data[0]
+
     keputusan = menu("KEPUTUSAN", ["Diterima", "Ditolak"])
     if keputusan == "Diterima":
+        # Kuota terpakai = jumlah penetapan Diterima dari semua pendaftaran di jalur ini
         sisa = ambil_satu("""
             SELECT j.kuota - COUNT(t.id_penetapan)
             FROM jalur_beasiswa j
-            LEFT JOIN penetapan t ON t.jalur_beasiswa_id_jalur = j.id_jalur AND t.status_keputusan = 'Diterima'
-            WHERE j.id_jalur = (SELECT id_jalur FROM pendaftaran WHERE id_pendaftaran = %s)
-            GROUP BY j.kuota""", (id_pd,))
+            LEFT JOIN pendaftaran p2 ON p2.id_jalur = j.id_jalur
+            LEFT JOIN penetapan t ON t.id_pendaftaran = p2.id_pendaftaran AND t.status_keputusan = 'Diterima'
+            WHERE j.id_jalur = %s
+            GROUP BY j.kuota""", (id_jalur,))
         if sisa is not None and sisa[0] <= 0:
             print("Kuota jalur ini sudah penuh.")
             return
     catatan = input("Catatan keputusan (boleh kosong): ").strip()
     if catatan == "":
         catatan = None
-    if ubah("""INSERT INTO penetapan (status_keputusan, catatan_keputusan, pengguna_id_pengguna,
-                                      jalur_beasiswa_id_jalur, mahasiswa_id_pengguna)
-               SELECT %s, %s, %s, id_jalur, id_pengguna FROM pendaftaran WHERE id_pendaftaran = %s""",
-            (keputusan, catatan, uid, id_pd)):
+    try:
+        cur.execute("""INSERT INTO penetapan (tanggal_penetapan, status_keputusan, catatan_keputusan,
+                                              id_pengguna, id_pendaftaran)
+                       VALUES (CURRENT_DATE, %s, %s, %s, %s)""", (keputusan, catatan, uid, id_pd))
+        cur.execute("UPDATE pendaftaran SET status_pendaftaran = 'Ditetapkan' WHERE id_pendaftaran = %s", (id_pd,))
+        conn.commit()
         print("Keputusan " + keputusan + " tersimpan.")
+    except Exception as e:
+        conn.rollback()
+        print("[ERROR]", str(e).split("\n")[0])
 
 
 def vf_pengumuman(uid):
@@ -532,12 +633,22 @@ def vf_pengumuman(uid):
                                FROM pengumuman ORDER BY 1""")
         tampil_tabel(["ID", "Judul", "Tanggal", "Status"], baris)
     elif pilih == "Buat baru":
-        status = menu("STATUS", ["Draft", "Terbit"])
-        judul_baru = tanya("Judul")
-        isi = tanya("Isi")
-        if ubah("""INSERT INTO pengumuman (judul, isi_pengumuman, status_pengumuman, pengguna_id_pengguna)
-                   VALUES (%s, %s, %s, %s)""", (judul_baru, isi, status, uid)):
-            print("Pengumuman disimpan.")
+        # Pengumuman selalu terkait satu penetapan
+        id_t = pilih_id("""
+            SELECT t.id_penetapan, pg.nama_pengguna, j.nama_jalur, t.status_keputusan::text
+            FROM penetapan t
+            JOIN pendaftaran pd ON pd.id_pendaftaran = t.id_pendaftaran
+            JOIN pengguna pg ON pg.id_pengguna = pd.id_pengguna
+            JOIN jalur_beasiswa j ON j.id_jalur = pd.id_jalur
+            ORDER BY 1""", (), ["ID Penetapan", "Mahasiswa", "Jalur", "Keputusan"], "ID penetapan")
+        if id_t != 0:
+            status = menu("STATUS", ["Draft", "Terbit"])
+            judul_baru = tanya("Judul")
+            isi = tanya("Isi")
+            if ubah("""INSERT INTO pengumuman (judul, isi_pengumuman, tanggal_publikasi, status_pengumuman,
+                                               id_penetapan, id_pengguna)
+                       VALUES (%s, %s, CURRENT_DATE, %s, %s, %s)""", (judul_baru, isi, status, id_t, uid)):
+                print("Pengumuman disimpan.")
     elif pilih == "Terbitkan draft":
         id_p = pilih_id("SELECT id_pengumuman, judul FROM pengumuman WHERE status_pengumuman = 'Draft' ORDER BY 1",
                         (), ["ID", "Judul"], "ID pengumuman")
@@ -547,60 +658,12 @@ def vf_pengumuman(uid):
                 print("Pengumuman diterbitkan.")
 
 
-def vf_jalur(uid):
-    pilih = menu("KELOLA JALUR & PERSYARATAN", ["Lihat", "Tambah jalur", "Tambah persyaratan", "Ubah kuota", "Kembali"])
-    if pilih == "Lihat":
-        baris = ambil_semua("""
-            SELECT j.id_jalur, j.nama_jalur, j.kuota, COUNT(p.id_persyaratan)
-            FROM jalur_beasiswa j LEFT JOIN persyaratan p ON p.id_jalur = j.id_jalur
-            GROUP BY j.id_jalur ORDER BY 1""")
-        tampil_tabel(["ID", "Jalur", "Kuota", "Jumlah persyaratan"], baris)
-    elif pilih == "Tambah jalur":
-        nama = tanya("Nama jalur")
-        deskripsi = tanya("Deskripsi")
-        kuota = tanya_angka("Kuota", 1)
-        if ubah("""INSERT INTO jalur_beasiswa (nama_jalur, deskripsi, kuota, id_pengguna)
-                   VALUES (%s, %s, %s, %s)""", (nama, deskripsi, kuota, uid)):
-            print("Jalur ditambahkan.")
-    elif pilih == "Tambah persyaratan":
-        id_j = pilih_id("SELECT id_jalur, nama_jalur FROM jalur_beasiswa ORDER BY 1", (), ["ID", "Jalur"], "ID jalur")
-        if id_j != 0:
-            nama = tanya("Nama persyaratan")
-            deskripsi = tanya("Deskripsi")
-            if ubah("""INSERT INTO persyaratan (nama_persyaratan, deskripsi_persyaratan, id_jalur)
-                       VALUES (%s, %s, %s)""", (nama, deskripsi, id_j)):
-                print("Persyaratan ditambahkan.")
-    elif pilih == "Ubah kuota":
-        id_j = pilih_id("SELECT id_jalur, nama_jalur, kuota FROM jalur_beasiswa ORDER BY 1", (),
-                        ["ID", "Jalur", "Kuota"], "ID jalur")
-        if id_j != 0:
-            kuota = tanya_angka("Kuota baru", 1)
-            if ubah("UPDATE jalur_beasiswa SET kuota = %s WHERE id_jalur = %s", (kuota, id_j)):
-                print("Kuota diperbarui.")
-
-
-def vf_laporan(uid):
-    judul("LAPORAN SISTEM")
-    baris = ambil_semua("""
-        SELECT j.nama_jalur, j.kuota,
-               (SELECT COUNT(*) FROM pendaftaran pd WHERE pd.id_jalur = j.id_jalur),
-               (SELECT COUNT(*) FROM penetapan t
-                WHERE t.jalur_beasiswa_id_jalur = j.id_jalur AND t.status_keputusan = 'Diterima'),
-               (SELECT COUNT(*) FROM penetapan t
-                WHERE t.jalur_beasiswa_id_jalur = j.id_jalur AND t.status_keputusan = 'Ditolak')
-        FROM jalur_beasiswa j ORDER BY j.id_jalur""")
-    tampil_tabel(["Jalur", "Kuota", "Pendaftar", "Diterima", "Ditolak"], baris)
-    total = ambil_satu("SELECT COALESCE(SUM(nominal), 0) FROM pencairan WHERE status_pencairan = 'Berhasil'")
-    print("Total dana tersalurkan:", rupiah(total[0]))
-
-
 def dashboard_verifikator(uid, nama):
     while True:
         banner()
-        print("Halo, " + nama + "! (Verifikator " + vf_info(uid)[1] + ")")
+        print("Halo, " + nama + "! (Verifikator " + jenis_verifikator(uid) + ")")
         pilih = menu("MENU VERIFIKATOR", ["Data pendaftaran", "Verifikasi dokumen", "Nilai pendaftar",
-                                          "Tetapkan penerima", "Pengumuman", "Kelola jalur & persyaratan",
-                                          "Laporan sistem", "Logout"])
+                                          "Tetapkan penerima", "Pengumuman", "Logout"])
         if pilih == "Data pendaftaran":
             vf_pendaftaran(uid)
         elif pilih == "Verifikasi dokumen":
@@ -611,10 +674,6 @@ def dashboard_verifikator(uid, nama):
             vf_tetapkan(uid)
         elif pilih == "Pengumuman":
             vf_pengumuman(uid)
-        elif pilih == "Kelola jalur & persyaratan":
-            vf_jalur(uid)
-        elif pilih == "Laporan sistem":
-            vf_laporan(uid)
         else:
             return
         tunggu()
@@ -626,15 +685,16 @@ def dashboard_verifikator(uid, nama):
 def pt_penerima(uid):
     judul("PENERIMA BEASISWA")
     baris = ambil_semua("""
-        SELECT t.id_penetapan, m.nama_mahasiswa, j.nama_jalur,
+        SELECT t.id_penetapan, pg.nama_pengguna, j.nama_jalur,
                COALESCE((SELECT string_agg(r.nama_bank || ' (' || r.status_validasi || ')', ', ')
-                         FROM rekening_bank r WHERE r.mahasiswa_id_pengguna = t.mahasiswa_id_pengguna),
+                         FROM rekening_bank r WHERE r.id_mahasiswa = pd.id_pengguna),
                         'Belum ada rekening'),
                COALESCE(c.status_pencairan, 'Belum dicairkan')
         FROM penetapan t
-        JOIN mahasiswa m ON m.id_pengguna = t.mahasiswa_id_pengguna
-        JOIN jalur_beasiswa j ON j.id_jalur = t.jalur_beasiswa_id_jalur
-        LEFT JOIN pencairan c ON c.penetapan_id_penetapan = t.id_penetapan
+        JOIN pendaftaran pd ON pd.id_pendaftaran = t.id_pendaftaran
+        JOIN pengguna pg ON pg.id_pengguna = pd.id_pengguna
+        JOIN jalur_beasiswa j ON j.id_jalur = pd.id_jalur
+        LEFT JOIN pencairan c ON c.id_penetapan = t.id_penetapan
         WHERE t.status_keputusan = 'Diterima'
         ORDER BY 1""")
     tampil_tabel(["ID Penetapan", "Mahasiswa", "Jalur", "Rekening", "Pencairan"], baris)
@@ -643,14 +703,14 @@ def pt_penerima(uid):
 def pt_validasi(uid):
     judul("VALIDASI REKENING")
     id_rek = pilih_id("""
-        SELECT r.id_rekening, m.nama_mahasiswa, r.nama_bank, r.nomor_rekening, r.nama_pemilik_rekening
-        FROM rekening_bank r JOIN mahasiswa m ON m.id_pengguna = r.mahasiswa_id_pengguna
+        SELECT r.id_rekening, pg.nama_pengguna, r.nama_bank, r.nomor_rekening, r.nama_pemilik_rekening
+        FROM rekening_bank r JOIN pengguna pg ON pg.id_pengguna = r.id_mahasiswa
         WHERE r.status_validasi = 'Belum Valid'
         ORDER BY 1""", (), ["ID", "Mahasiswa", "Bank", "No. Rekening", "Atas nama"], "ID rekening")
     if id_rek == 0:
         return
     if input("Nama pemilik sesuai dan rekening aktif? Validasi (y/n): ") == "y":
-        if ubah("""UPDATE rekening_bank SET status_validasi = 'Valid', pengguna_id_pengguna = %s
+        if ubah("""UPDATE rekening_bank SET status_validasi = 'Valid', id_pengguna = %s
                    WHERE id_rekening = %s""", (uid, id_rek)):
             print("Rekening divalidasi.")
 
@@ -658,11 +718,12 @@ def pt_validasi(uid):
 def pt_cairkan(uid):
     judul("PROSES PENCAIRAN")
     id_t = pilih_id("""
-        SELECT t.id_penetapan, m.nama_mahasiswa, j.nama_jalur, COALESCE(c.status_pencairan, 'Belum dicairkan')
+        SELECT t.id_penetapan, pg.nama_pengguna, j.nama_jalur, COALESCE(c.status_pencairan, 'Belum dicairkan')
         FROM penetapan t
-        JOIN mahasiswa m ON m.id_pengguna = t.mahasiswa_id_pengguna
-        JOIN jalur_beasiswa j ON j.id_jalur = t.jalur_beasiswa_id_jalur
-        LEFT JOIN pencairan c ON c.penetapan_id_penetapan = t.id_penetapan
+        JOIN pendaftaran pd ON pd.id_pendaftaran = t.id_pendaftaran
+        JOIN pengguna pg ON pg.id_pengguna = pd.id_pengguna
+        JOIN jalur_beasiswa j ON j.id_jalur = pd.id_jalur
+        LEFT JOIN pencairan c ON c.id_penetapan = t.id_penetapan
         WHERE t.status_keputusan = 'Diterima' AND (c.id_pencairan IS NULL OR c.status_pencairan = 'Tertunda')
         ORDER BY 1""", (), ["ID Penetapan", "Mahasiswa", "Jalur", "Status"], "ID penetapan")
     if id_t == 0:
@@ -670,7 +731,9 @@ def pt_cairkan(uid):
 
     rek = ambil_satu("""
         SELECT r.id_rekening, r.nama_bank, r.nomor_rekening
-        FROM rekening_bank r JOIN penetapan t ON t.mahasiswa_id_pengguna = r.mahasiswa_id_pengguna
+        FROM rekening_bank r
+        JOIN pendaftaran pd ON pd.id_pengguna = r.id_mahasiswa
+        JOIN penetapan t ON t.id_pendaftaran = pd.id_pendaftaran
         WHERE t.id_penetapan = %s AND r.status_validasi = 'Valid'
         ORDER BY 1 LIMIT 1""", (id_t,))
     if rek is None:
@@ -679,32 +742,49 @@ def pt_cairkan(uid):
     print("Rekening tujuan: " + str(rek[1]) + " " + str(rek[2]))
     nominal = tanya_angka("Nominal (Rp)", 1)
 
+    # Pencairan wajib terkait satu anggaran: pakai anggaran terbaru yang sisanya cukup
+    anggaran = ambil_satu("""SELECT id_anggaran FROM anggaran_beasiswa
+                             WHERE sisa_anggaran >= %s
+                             ORDER BY tahun_anggaran DESC, id_anggaran LIMIT 1""", (nominal,))
+    if anggaran is None:
+        print("Tidak ada anggaran beasiswa dengan sisa yang cukup.")
+        return
+
     # Nomor referensi: TRX-tanggal-nomor urut (dibuat oleh SQL)
     referensi = ("'TRX-' || to_char(CURRENT_DATE, 'YYYYMMDD') || '-' || "
                  "LPAD((SELECT COUNT(*) + 1 FROM pencairan)::text, 3, '0')")
-    sudah_ada = ambil_satu("SELECT id_pencairan FROM pencairan WHERE penetapan_id_penetapan = %s", (id_t,))
-    if sudah_ada is not None:      # sebelumnya Tertunda: ubah jadi Berhasil
-        sql = ("UPDATE pencairan SET status_pencairan = 'Berhasil', tanggal_pencairan = CURRENT_DATE, "
-               "nominal = %s, referensi_transaksi = " + referensi + ", rekening_bank_id_rekening = %s, "
-               "pengguna_id_pengguna = %s WHERE penetapan_id_penetapan = %s")
-        berhasil = ubah(sql, (nominal, rek[0], uid, id_t))
-    else:
-        sql = ("INSERT INTO pencairan (nominal, status_pencairan, referensi_transaksi, penetapan_id_penetapan, "
-               "rekening_bank_id_rekening, pengguna_id_pengguna) VALUES (%s, 'Berhasil', " + referensi +
-               ", %s, %s, %s)")
-        berhasil = ubah(sql, (nominal, id_t, rek[0], uid))
-    if berhasil:
+    sudah_ada = ambil_satu("SELECT id_pencairan FROM pencairan WHERE id_penetapan = %s", (id_t,))
+
+    # Pencairan + pengurangan sisa anggaran dalam satu transaksi
+    try:
+        if sudah_ada is not None:      # sebelumnya Tertunda: ubah jadi Berhasil
+            cur.execute("UPDATE pencairan SET status_pencairan = 'Berhasil', tanggal_pencairan = CURRENT_DATE, "
+                        "nominal = %s, referensi_transaksi = " + referensi + ", id_rekening = %s, "
+                        "id_pengguna = %s, id_anggaran = %s WHERE id_penetapan = %s",
+                        (nominal, rek[0], uid, anggaran[0], id_t))
+        else:
+            cur.execute("INSERT INTO pencairan (tanggal_pencairan, nominal, status_pencairan, referensi_transaksi, "
+                        "id_penetapan, id_rekening, id_pengguna, id_anggaran) "
+                        "VALUES (CURRENT_DATE, %s, 'Berhasil', " + referensi + ", %s, %s, %s, %s)",
+                        (nominal, id_t, rek[0], uid, anggaran[0]))
+        cur.execute("UPDATE anggaran_beasiswa SET sisa_anggaran = sisa_anggaran - %s WHERE id_anggaran = %s",
+                    (nominal, anggaran[0]))
+        conn.commit()
         print("Pencairan berhasil.")
+    except Exception as e:
+        conn.rollback()
+        print("[ERROR]", str(e).split("\n")[0])
 
 
 def pt_riwayat(uid):
     judul("RIWAYAT PENCAIRAN")
     baris = ambil_semua("""
-        SELECT c.id_pencairan, c.tanggal_pencairan, m.nama_mahasiswa, c.nominal, c.status_pencairan,
+        SELECT c.id_pencairan, c.tanggal_pencairan, pg.nama_pengguna, c.nominal, c.status_pencairan,
                COALESCE(c.referensi_transaksi, '-')
         FROM pencairan c
-        JOIN penetapan t ON t.id_penetapan = c.penetapan_id_penetapan
-        JOIN mahasiswa m ON m.id_pengguna = t.mahasiswa_id_pengguna
+        JOIN penetapan t ON t.id_penetapan = c.id_penetapan
+        JOIN pendaftaran pd ON pd.id_pendaftaran = t.id_pendaftaran
+        JOIN pengguna pg ON pg.id_pengguna = pd.id_pengguna
         ORDER BY c.id_pencairan""")
     tampil_tabel(["ID", "Tanggal", "Mahasiswa", "Nominal", "Status", "Referensi"], baris)
 

@@ -789,12 +789,27 @@ def pt_riwayat(uid):
     tampil_tabel(["ID", "Tanggal", "Mahasiswa", "Nominal", "Status", "Referensi"], baris)
 
 
+def pt_anggaran(uid):
+    judul("SISA ANGGARAN")
+    baris = ambil_semua("""
+        SELECT id_anggaran, nama_anggaran, tahun_anggaran,
+               total_anggaran, total_anggaran - sisa_anggaran, sisa_anggaran,
+               ROUND(sisa_anggaran * 100.0 / NULLIF(total_anggaran, 0), 1)
+        FROM anggaran_beasiswa
+        ORDER BY tahun_anggaran DESC, id_anggaran""")
+    hasil = []
+    for b in baris:
+        hasil.append((b[0], b[1], b[2], rupiah(b[3]), rupiah(b[4]), rupiah(b[5]), str(b[6]) + "%"))
+    tampil_tabel(["ID", "Nama", "Tahun", "Total", "Terpakai", "Sisa", "Sisa (%)"], hasil)
+
+
 def dashboard_petugas(uid, nama):
     while True:
         banner()
         print("Halo, " + nama + "! (Petugas Pencairan)")
         pilih = menu("MENU PETUGAS PENCAIRAN", ["Daftar penerima beasiswa", "Validasi rekening",
-                                                "Proses pencairan", "Riwayat pencairan", "Logout"])
+                                                "Proses pencairan", "Riwayat pencairan",
+                                                "Lihat anggaran", "Logout"])
         if pilih == "Daftar penerima beasiswa":
             pt_penerima(uid)
         elif pilih == "Validasi rekening":
@@ -803,6 +818,8 @@ def dashboard_petugas(uid, nama):
             pt_cairkan(uid)
         elif pilih == "Riwayat pencairan":
             pt_riwayat(uid)
+        elif pilih == "Lihat anggaran":
+            pt_anggaran(uid)
         else:
             return
         tunggu()
